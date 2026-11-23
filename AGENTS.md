@@ -6,6 +6,8 @@ DO NOT send optional commentary
 
 For issues, task branches, PRs, verification, and milestones in product-line-model-relay, read [CONTRIBUTING.md](CONTRIBUTING.md). Follow the technical and upstream rules below for the affected paths.
 
+Find repository skills under [`.agents/skills/`](.agents/skills/) and see [how to use and maintain them](CONTRIBUTING.md#skill-的使用与维护).
+
 ## Overview
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
