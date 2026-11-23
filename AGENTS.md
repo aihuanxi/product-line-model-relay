@@ -2,6 +2,10 @@
 
 DO NOT send optional commentary
 
+## Product-line development workflow
+
+For issues, task branches, PRs, verification, and milestones in product-line-model-relay, read [CONTRIBUTING.md](CONTRIBUTING.md). Follow the technical and upstream rules below for the affected paths.
+
 ## Overview
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
