@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -380,7 +381,11 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	ctx := context.Background()
+	if info.IsProductRelay {
+		ctx = c.Request.Context()
+	}
+	req, err := http.NewRequestWithContext(ctx, c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -394,6 +399,12 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	// 这样可以覆盖默认的 Authorization header 设置
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
+	}
+	if info.IsProductRelay {
+		// A lost provider response leaves acceptance unknown. Keep this POST single-attempt.
+		req.GetBody = nil
+		req.Header.Del("Idempotency-Key")
+		req.Header.Del("X-Idempotency-Key")
 	}
 	if err = signUpstreamRequest(a, c, info, req.Method, req.URL, req.Header); err != nil {
 		return nil, err
