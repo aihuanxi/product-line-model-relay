@@ -246,6 +246,42 @@ For production, put the console behind HTTPS and configure your reverse proxy fo
 
 Pin an image version from [Releases](https://github.com/QuantumNous/new-api/releases), review its upgrade notes, and back up before upgrading. The `latest` tag follows published builds and can change; migrations and compatibility must be assessed for your existing installation.
 
+### Product chat relay
+
+Set `PRODUCT_RELAY_CONFIG_FILE` to enable `POST /product/v1/chat/completions` for one OpenAI channel. Use `/product/v1` as the SDK base path and HTTPS at the public ingress. The channel must list the configured model and use native chat completions with streaming usage. Configure its provider key in the channel and leave its parameter overrides empty. Set the metering service credential through `PRODUCT_RELAY_METERING_TOKEN`.
+
+```json
+{
+  "issuer": "example-issuer",
+  "audience": "model-relay",
+  "environment": "test",
+  "model": "example-model",
+  "channel_id": 1,
+  "max_output_tokens": 256,
+  "trust_file": "/etc/model-relay/trust.json",
+  "metering_url": "https://metering.example.com/internal/v1/usage:ingest"
+}
+```
+
+The local integration uses a versioned trust snapshot with `signing_keys` (JWT key ID to public key), `instances` (product ID to instance ID to public key), `revoked_access_ids` (array), and `allocations` (product ID to allocation ID to cumulative call allowance). Encode Ed25519 public keys as unpadded base64url. Publish a complete file with a higher integer `version` using atomic replacement. The process loads it at startup and checks for updates every 10 seconds. The gateway retains the last valid snapshot when a refresh fails. Combine the allocation allowance and output cap for local admission. Replicas share the main database.
+
+Send a resource JWT as `Authorization: Bearer <token>`. Set its header to `alg: EdDSA` and `typ: resource+jwt`, with a configured `kid`. Use `sub` for the product user ID and include one `aud`, `iss`, `iat`, `exp`, `access_id`, `allocation_id`, `product_id`, `environment`, `instance_id`, `payer_id`, `payer_type`, and `model`. The lifetime limit is one hour. Use `personal` or `organization` as the payer type and provide `workspace_id` for organizations.
+
+Use a stable `Idempotency-Key` per original call. Sign the following UTF-8 text with the registered instance's Ed25519 private key and send the unpadded base64url signature as `X-Resource-Instance-Proof`. Use lowercase hexadecimal SHA-256 digests, LF line separators and no trailing newline. Hash the raw decompressed JSON bytes.
+
+```text
+product-model-relay-v1
+POST
+/product/v1/chat/completions
+<sha256 of the bearer token>
+<idempotency key>
+<sha256 of the JSON body>
+```
+
+The gateway returns `X-Product-Call-Id` and `X-Product-Attempt-Id` for accepted calls. An authenticated replay with the same bytes and attribution returns a JSON status record and any confirmed usage. The gateway returns HTTP 409 when a key is reused with different bytes or attribution. Each new admitted attempt consumes one local call credit. When provider acceptance or final usage is unknown, the gateway retains the original attempt and provider identifiers for review.
+
+The background reporter sends `{"events":[...]}` over HTTPS with its own bearer credential. Loopback IPs can use HTTP for local tests. The receiver acknowledges accepted IDs with `{"acceptedEventIds":[...]}` and deduplicates by `eventId`. An event has call and attempt IDs, product and payer attribution, model and provider identifiers, and the recorded status. Confirmed events include actual input, output and total tokens. Pending-review events omit token counts.
+
 <a id="development"></a>
 
 ## Development and extensions

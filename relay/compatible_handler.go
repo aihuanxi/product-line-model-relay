@@ -59,7 +59,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		request.StreamOptions = nil
 	} else {
 		// 如果支持StreamOptions，且请求中没有设置StreamOptions，根据配置文件设置StreamOptions
-		if constant.ForceStreamOption || info.IsProductRelay {
+		if constant.ForceStreamOption || info.ProductAttempt != nil {
 			request.StreamOptions = &dto.StreamOptions{
 				IncludeUsage: true,
 			}
@@ -74,9 +74,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 	adaptor.Init(info)
 
-	passThrough := !info.IsProductRelay && (model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
+	passThrough := info.ProductAttempt == nil && (model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled)
 	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
-		!info.IsProductRelay && !passThrough &&
+		info.ProductAttempt == nil && !passThrough &&
 		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
 		applySystemPromptIfNeeded(c, info, request)
 		usage, newApiErr := textRequestViaResponses(c, info, adaptor, request)
@@ -169,6 +169,15 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		if attempt := info.ProductAttempt; attempt != nil {
+			attempt.UpstreamStatus = httpResp.StatusCode
+			attempt.ProviderRequest = httpResp.Header.Get("X-Request-Id")
+			if attempt.ProviderRequest != "" {
+				if err := attempt.SaveEvidence(); err != nil {
+					logger.LogError(c, "failed to persist product provider request ID")
+				}
+			}
+		}
 		if httpResp.StatusCode != http.StatusOK {
 			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码
@@ -183,7 +192,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return newApiErr
 	}
-	if info.IsProductRelay {
+	if info.ProductAttempt != nil {
 		return nil
 	}
 

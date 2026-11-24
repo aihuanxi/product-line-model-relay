@@ -5,7 +5,6 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -233,16 +232,16 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
-	productRelay, err := controller.LoadProductRelay(os.Getenv("PRODUCT_RELAY_CONFIG_FILE"))
+	productRelay, err := controller.LoadProductRelay(os.Getenv("PRODUCT_RELAY_CONFIG_FILE"), os.Getenv("PRODUCT_RELAY_METERING_TOKEN"))
 	if err != nil {
-		common.FatalLog(fmt.Sprintf("failed to initialize product relay: %v", err))
+		common.FatalLog(common.LogText("failed to initialize product relay: %v", err))
 		return
 	}
 	router.SetProductRelayRouter(server, productRelay)
 	if productRelay != nil {
 		productContext, stopProduct := context.WithCancel(context.Background())
 		defer stopProduct()
-		go productRelay.SyncTrust(productContext)
+		go productRelay.Run(productContext)
 	}
 	var port = os.Getenv("PORT")
 	if port == "" {

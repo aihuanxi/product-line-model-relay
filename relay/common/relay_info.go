@@ -81,6 +81,25 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// ProductRelayAttempt carries provider evidence to the local metering record.
+// The authorization and customer attribution stay at the product entry point.
+type ProductRelayAttempt struct {
+	ID              string
+	Dispatched      bool
+	UpstreamStatus  int
+	UpstreamModel   string
+	ProviderRequest string
+	ProviderReply   string
+	Usage           *ProductTokenUsage
+	SaveEvidence    func() error
+}
+
+type ProductTokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+}
+
 type RelayInfo struct {
 	TokenId           int
 	TokenKey          string
@@ -94,7 +113,7 @@ type RelayInfo struct {
 	isFirstResponse   bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
-	IsProductRelay         bool
+	ProductAttempt         *ProductRelayAttempt
 	IsGeminiBatchEmbedding bool
 	IsPlayground           bool
 	UsePrice               bool

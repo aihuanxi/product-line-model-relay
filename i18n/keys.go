@@ -52,6 +52,22 @@ const (
 	MsgRelayRequestRejected              = "relay.request_rejected"
 	MsgRelayRequestPluginFailed          = "relay.request_plugin_failed"
 	MsgRelayResponseRejected             = "relay.response_rejected"
+	MsgProductCredentialsRequired        = "product_relay.credentials_required"
+	MsgProductInvalidCredential          = "product_relay.invalid_credential"
+	MsgProductMediaType                  = "product_relay.media_type"
+	MsgProductBodyTooLarge               = "product_relay.body_too_large"
+	MsgProductReadBody                   = "product_relay.read_body"
+	MsgProductInvalidChat                = "product_relay.invalid_chat"
+	MsgProductModelScope                 = "product_relay.model_scope"
+	MsgProductSingleCompletion           = "product_relay.single_completion"
+	MsgProductSingleLimit                = "product_relay.single_limit"
+	MsgProductOutputLimit                = "product_relay.output_limit"
+	MsgProductAllocationExhausted        = "product_relay.allocation_exhausted"
+	MsgProductRecordCall                 = "product_relay.record_call"
+	MsgProductIdempotencyConflict        = "product_relay.idempotency_conflict"
+	MsgProductChannelUnavailable         = "product_relay.channel_unavailable"
+	MsgProductPersistUsage               = "product_relay.persist_usage"
+	MsgProductIncompleteStream           = "product_relay.incomplete_stream"
 )
 
 // Emails and the name of the token created at registration, in the
