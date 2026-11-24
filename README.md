@@ -248,39 +248,30 @@ Pin an image version from [Releases](https://github.com/QuantumNous/new-api/rele
 
 ### Product chat relay
 
-Set `PRODUCT_RELAY_CONFIG_FILE` to enable `POST /product/v1/chat/completions` for one OpenAI channel. Use `/product/v1` as the SDK base path and HTTPS at the public ingress. The channel must list the configured model and use native chat completions with streaming usage. Configure its provider key in the channel and leave its parameter overrides empty. Set the metering service credential through `PRODUCT_RELAY_METERING_TOKEN`.
+Set `PRODUCT_RELAY_CONFIG_FILE` to enable `POST /product/v1/chat/completions` for one product environment and one OpenAI channel. Use `/product/v1` as the SDK base path and HTTPS at the public ingress. The channel must list the configured model and support native chat completions with streaming usage. Configure its provider key in the channel and leave its parameter overrides empty. Inject the resource service credential through `PRODUCT_RELAY_BILLING_TOKEN`.
 
 ```json
 {
   "issuer": "example-issuer",
-  "audience": "model-relay",
+  "product_id": "example-product",
   "environment": "test",
   "model": "example-model",
   "channel_id": 1,
   "max_output_tokens": 256,
-  "trust_file": "/etc/model-relay/trust.json",
-  "metering_url": "https://metering.example.com/internal/v1/usage:ingest"
+  "trust_file": "/etc/model-relay/verification.json",
+  "billing_url": "https://billing.example.com",
+  "partition_id": "relay-primary",
+  "billing_account_ids": ["example-billing-account"]
 }
 ```
 
-The local integration uses a versioned trust snapshot with `signing_keys` (JWT key ID to public key), `instances` (product ID to instance ID to public key), `revoked_access_ids` (array), and `allocations` (product ID to allocation ID to cumulative call allowance). Encode Ed25519 public keys as unpadded base64url. Publish a complete file with a higher integer `version` using atomic replacement. The process loads it at startup and checks for updates every 10 seconds. The gateway retains the last valid snapshot when a refresh fails. Combine the allocation allowance and output cap for local admission. Replicas share the main database.
+The background worker retrieves the v1 verification snapshot every 15 seconds and obtains missing call allocations for the configured billing accounts. Mount the verification file's directory on persistent storage with write access for the relay. The worker replaces the cache atomically. After a restart or a billing service outage, the relay uses the last persisted snapshot, credential expiry and remaining allocations. Replicas for the same partition share the main database.
 
-Send a resource JWT as `Authorization: Bearer <token>`. Set its header to `alg: EdDSA` and `typ: resource+jwt`, with a configured `kid`. Use `sub` for the product user ID and include one `aud`, `iss`, `iat`, `exp`, `access_id`, `allocation_id`, `product_id`, `environment`, `instance_id`, `payer_id`, `payer_type`, and `model`. The lifetime limit is one hour. Use `personal` or `organization` as the payer type and provide `workspace_id` for organizations.
+Send the resource JWT in `Authorization: Bearer <token>` and the registered instance credential in `X-Huanxi-Instance-Credential`. The relay validates Ed25519 signing keys, the `model-relay` audience, the configured product and environment, the model scope, the instance credential digest and the revoked access IDs. It consumes both headers at the ingress.
 
-Use a stable `Idempotency-Key` per original call. Sign the following UTF-8 text with the registered instance's Ed25519 private key and send the unpadded base64url signature as `X-Resource-Instance-Proof`. Use lowercase hexadecimal SHA-256 digests, LF line separators and no trailing newline. Hash the raw decompressed JSON bytes.
+Use a stable `Idempotency-Key` per original call. The gateway returns `X-Product-Call-Id` and `X-Product-Attempt-Id`. An authenticated replay with the same bytes and attribution returns a JSON status record and any confirmed usage. Reusing a key with different bytes or attribution returns HTTP 409. Each admitted attempt consumes one call credit. Unknown outcomes retain the original attempt and provider identifiers for review.
 
-```text
-product-model-relay-v1
-POST
-/product/v1/chat/completions
-<sha256 of the bearer token>
-<idempotency key>
-<sha256 of the JSON body>
-```
-
-The gateway returns `X-Product-Call-Id` and `X-Product-Attempt-Id` for accepted calls. An authenticated replay with the same bytes and attribution returns a JSON status record and any confirmed usage. The gateway returns HTTP 409 when a key is reused with different bytes or attribution. Each new admitted attempt consumes one local call credit. When provider acceptance or final usage is unknown, the gateway retains the original attempt and provider identifiers for review.
-
-The background reporter sends `{"events":[...]}` over HTTPS with its own bearer credential. Loopback IPs can use HTTP for local tests. The receiver acknowledges accepted IDs with `{"acceptedEventIds":[...]}` and deduplicates by `eventId`. An event has call and attempt IDs, product and payer attribution, model and provider identifiers, and the recorded status. Confirmed events include actual input, output and total tokens. Pending-review events omit token counts.
+The outbox sends confirmed and pending v1 events to `/internal/v1/usage:ingest`. Confirmed events carry actual input and output tokens. Pending events retain the original attribution and evidence reference. A per-event `posted` or `pending` result acknowledges delivery. The worker resends unacknowledged events with the original event IDs.
 
 <a id="development"></a>
 

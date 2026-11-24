@@ -60,6 +60,7 @@ product_relay.idempotency_conflict: "该幂等键已被不同的请求使用。"
 product_relay.channel_unavailable: "配置的产品渠道不可用。"
 product_relay.persist_usage: "无法保存模型实际用量。"
 product_relay.incomplete_stream: "上游响应流在完成前中断。"
+product_relay.verification_unavailable: "产品验签暂时不可用。"
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}的初始令牌"

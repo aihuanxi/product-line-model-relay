@@ -68,6 +68,7 @@ const (
 	MsgProductChannelUnavailable         = "product_relay.channel_unavailable"
 	MsgProductPersistUsage               = "product_relay.persist_usage"
 	MsgProductIncompleteStream           = "product_relay.incomplete_stream"
+	MsgProductVerificationUnavailable    = "product_relay.verification_unavailable"
 )
 
 // Emails and the name of the token created at registration, in the

@@ -59,6 +59,7 @@ product_relay.idempotency_conflict: "This idempotency key belongs to a different
 product_relay.channel_unavailable: "The configured product channel is unavailable."
 product_relay.persist_usage: "Unable to persist actual model usage."
 product_relay.incomplete_stream: "Upstream stream ended before completion."
+product_relay.verification_unavailable: "Product verification is temporarily unavailable."
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}'s initial token"

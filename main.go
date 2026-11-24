@@ -232,7 +232,7 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
-	productRelay, err := controller.LoadProductRelay(os.Getenv("PRODUCT_RELAY_CONFIG_FILE"), os.Getenv("PRODUCT_RELAY_METERING_TOKEN"))
+	productRelay, err := controller.LoadProductRelay(os.Getenv("PRODUCT_RELAY_CONFIG_FILE"), os.Getenv("PRODUCT_RELAY_BILLING_TOKEN"))
 	if err != nil {
 		common.FatalLog(common.LogText("failed to initialize product relay: %v", err))
 		return

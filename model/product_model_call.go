@@ -19,33 +19,34 @@ const (
 var ErrProductAllocationExhausted = errors.New("product model allocation exhausted")
 
 type ProductModelCall struct {
-	CallID          string `gorm:"size:64;primaryKey"`
-	AttemptID       string `gorm:"size:36;not null;uniqueIndex"`
-	RequestHash     string `gorm:"size:64;not null"`
-	ProductID       string `gorm:"size:128;not null"`
-	Environment     string `gorm:"size:128;not null"`
-	ProductUserID   string `gorm:"size:128;not null"`
-	WorkspaceID     string `gorm:"size:128;not null"`
-	PayerID         string `gorm:"size:128;not null"`
-	PayerType       string `gorm:"size:16;not null"`
-	InstanceID      string `gorm:"size:128;not null"`
-	AccessID        string `gorm:"size:128;not null"`
-	AllocationID    string `gorm:"size:128;not null"`
-	Model           string `gorm:"size:255;not null"`
-	ChannelID       int
-	UpstreamModel   string `gorm:"size:255"`
-	ProviderRequest string `gorm:"size:128"`
-	ProviderReply   string `gorm:"size:128"`
-	State           string `gorm:"size:24;not null;index:idx_product_call_review"`
-	InputTokens     *int64
-	OutputTokens    *int64
-	TotalTokens     *int64
-	CreatedAt       int64
-	FinishedAt      int64
-	ReviewAfter     int64 `gorm:"index:idx_product_call_review"`
-	DeliverAfter    int64 `gorm:"index"`
-	DeliveryTries   int
-	DeliveredAt     int64
+	CallID           string `gorm:"size:64;primaryKey"`
+	AttemptID        string `gorm:"size:36;not null;uniqueIndex"`
+	RequestHash      string `gorm:"size:64;not null"`
+	ProductID        string `gorm:"size:128;not null"`
+	Environment      string `gorm:"size:128;not null"`
+	ProductUserID    string `gorm:"size:128;not null"`
+	WorkspaceID      string `gorm:"size:128;not null"`
+	BillingAccountID string `gorm:"size:128;not null"`
+	OrganizationID   string `gorm:"size:128;not null"`
+	InstanceID       string `gorm:"size:128;not null"`
+	AccessID         string `gorm:"size:128;not null"`
+	IssuanceID       string `gorm:"size:128;not null"`
+	AllocationID     string `gorm:"size:128;not null"`
+	Model            string `gorm:"size:255;not null"`
+	ChannelID        int
+	UpstreamModel    string `gorm:"size:255"`
+	ProviderRequest  string `gorm:"size:128"`
+	ProviderReply    string `gorm:"size:128"`
+	State            string `gorm:"size:24;not null;index:idx_product_call_review"`
+	InputTokens      *int64
+	OutputTokens     *int64
+	TotalTokens      *int64
+	CreatedAt        int64 `gorm:"autoCreateTime:milli"`
+	FinishedAt       int64
+	ReviewAfter      int64 `gorm:"index:idx_product_call_review"`
+	DeliverAfter     int64 `gorm:"index"`
+	DeliveryTries    int
+	DeliveredAt      int64
 }
 
 type ProductModelAllocation struct {
