@@ -232,6 +232,17 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
+	productRelay, err := controller.LoadProductRelay(os.Getenv("PRODUCT_RELAY_CONFIG_FILE"), os.Getenv("PRODUCT_RELAY_BILLING_TOKEN"))
+	if err != nil {
+		common.FatalLog(common.LogText("failed to initialize product relay: %v", err))
+		return
+	}
+	router.SetProductRelayRouter(server, productRelay)
+	if productRelay != nil {
+		productContext, stopProduct := context.WithCancel(context.Background())
+		defer stopProduct()
+		go productRelay.Run(productContext)
+	}
 	var port = os.Getenv("PORT")
 	if port == "" {
 		port = strconv.Itoa(*common.Port)

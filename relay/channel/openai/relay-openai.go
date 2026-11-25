@@ -1,13 +1,16 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -119,11 +122,17 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var toolCount int
 	var usage = &dto.Usage{}
 	var lastStreamData string
+	var productMeteringErr error
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if info.ProductAttempt != nil {
+			if err := captureProductChatUsage(info.ProductAttempt, common.StringToByteSlice(data), true); err != nil {
+				productMeteringErr = err
+			}
+		}
 		if lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog(common.LogText("error handling stream format: %s", err.Error()))
@@ -137,9 +146,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 			lastStreamData = data
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
-			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
-				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
-				sr.Error(err)
+			if info.ProductAttempt == nil {
+				if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
+					logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
+					sr.Error(err)
+				}
 			}
 		}
 	})
@@ -182,7 +193,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
-	if !containStreamUsage {
+	if !containStreamUsage && info.ProductAttempt == nil {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
 	}
@@ -193,6 +204,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
+	if info.ProductAttempt != nil {
+		if productMeteringErr != nil {
+			return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgProductPersistUsage)), types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+		}
+		outcome := info.StreamStatus.OutcomeSnapshot()
+		if outcome.EndReason != relaycommon.StreamEndReasonDone && outcome.Response != relaycommon.ResponseOutcomeCompleted {
+			return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgProductIncompleteStream)), types.ErrorCodeBadResponse, http.StatusBadGateway)
+		}
+	}
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
@@ -306,7 +326,11 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	usageModified := false
-	if simpleResponse.Usage.PromptTokens == 0 {
+	if info.ProductAttempt != nil {
+		if err := captureProductChatUsage(info.ProductAttempt, responseBody, false); err != nil {
+			return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgProductPersistUsage)), types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+		}
+	} else if simpleResponse.Usage.PromptTokens == 0 {
 		completionTokens := simpleResponse.Usage.CompletionTokens
 		if completionTokens == 0 {
 			for _, choice := range simpleResponse.Choices {
@@ -370,4 +394,47 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	return &simpleResponse.Usage, nil
+}
+
+// captureProductChatUsage collects the actual provider counts before the
+// ordinary relay estimates or normalizes any of the values.
+func captureProductChatUsage(attempt *relaycommon.ProductRelayAttempt, raw []byte, stream bool) error {
+	if attempt.Usage != nil {
+		return nil
+	}
+	var response struct {
+		ID      string `json:"id"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			Prompt     *int64 `json:"prompt_tokens"`
+			Completion *int64 `json:"completion_tokens"`
+			Total      *int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := common.Unmarshal(raw, &response); err != nil {
+		return nil
+	}
+	newReply := attempt.ProviderReply == "" && response.ID != ""
+	if newReply {
+		attempt.ProviderReply = response.ID
+	}
+	counts := response.Usage
+	terminal := !stream || (response.Choices != nil && len(response.Choices) == 0) ||
+		(len(response.Choices) == 1 && response.Choices[0].FinishReason != "")
+	if terminal && counts != nil && counts.Prompt != nil && counts.Completion != nil && counts.Total != nil &&
+		*counts.Prompt >= 0 && *counts.Prompt <= math.MaxInt32 &&
+		*counts.Completion >= 0 && *counts.Completion <= math.MaxInt32 &&
+		*counts.Total == *counts.Prompt+*counts.Completion && *counts.Total <= math.MaxInt32 {
+		attempt.Usage = &relaycommon.ProductTokenUsage{
+			InputTokens: *counts.Prompt, OutputTokens: *counts.Completion, TotalTokens: *counts.Total,
+		}
+		return attempt.SaveEvidence()
+	}
+	if newReply {
+		// The terminal update will try again if the initial evidence write fails.
+		_ = attempt.SaveEvidence()
+	}
+	return nil
 }

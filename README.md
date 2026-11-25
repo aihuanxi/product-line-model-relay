@@ -246,6 +246,35 @@ For production, put the console behind HTTPS and configure your reverse proxy fo
 
 Pin an image version from [Releases](https://github.com/QuantumNous/new-api/releases), review its upgrade notes, and back up before upgrading. The `latest` tag follows published builds and can change; migrations and compatibility must be assessed for your existing installation.
 
+### Product chat relay
+
+Set `PRODUCT_RELAY_CONFIG_FILE` to enable `POST /product/v1/chat/completions` for one product environment and one OpenAI channel. Use `/product/v1` as the SDK base path and HTTPS at the public ingress. The channel must list the configured model and support native chat completions with streaming usage. Configure its provider key in the channel and leave its parameter overrides empty. Inject the resource service credential through `PRODUCT_RELAY_BILLING_TOKEN`.
+
+```json
+{
+  "issuer": "example-issuer",
+  "product_id": "example-product",
+  "environment": "test",
+  "model": "example-model",
+  "channel_id": 1,
+  "max_output_tokens": 256,
+  "trust_file": "/etc/model-relay/verification.json",
+  "billing_url": "https://billing.example.com",
+  "partition_id": "relay-primary",
+  "billing_account_ids": ["example-billing-account"]
+}
+```
+
+The background worker retrieves the v1 verification snapshot every 15 seconds and publishes it before obtaining missing call allocations for the configured billing accounts. Mount the verification file's directory on persistent storage with write access for the relay. The worker replaces the cache atomically. After a restart or a billing service outage, the relay uses the last persisted snapshot, credential expiry and remaining allocations. Replicas for the same partition share the main database. Each worker recovers and reports calls for its configured product, environment and partition.
+
+Send the resource JWT in `Authorization: Bearer <token>` and the registered instance credential in `X-Huanxi-Instance-Credential`. The relay validates Ed25519 signing keys, the `model-relay` audience, the configured product and environment, the model scope, the instance credential digest and the revoked access IDs. It consumes both headers at the ingress.
+
+Use a stable `Idempotency-Key` per original call. The gateway returns `X-Product-Call-Id` and `X-Product-Attempt-Id`. An authenticated replay with the same bytes and attribution returns a JSON status record and any confirmed usage. Reusing a key with different bytes or attribution returns HTTP 409. Each admitted attempt consumes one call credit. Unknown outcomes retain the original attempt and provider identifiers for review.
+
+The outbox sends confirmed and pending v1 events to `/internal/v1/usage:ingest`. Confirmed events carry actual input and output tokens and require a `posted` acknowledgement. Pending events retain the original attribution and evidence reference and accept a `pending` or `posted` acknowledgement. The worker resends unacknowledged events with the original event IDs.
+
+For a call awaiting review, use a root dashboard session to read `GET /api/product-model/calls/{call_id}`. The response includes the original attempt and any provider request or reply ID needed to check the provider's usage record. After verifying the actual counts for that attempt, `POST /api/product-model/calls/{call_id}/confirm` with `attempt_id`, `evidence_ref`, `input_tokens` and `output_tokens` as JSON. Supply both counts explicitly, including zero. The relay records the evidence reference and sends a separate confirmation event for the same call and attribution. Repeating the same confirmation is safe. Conflicting evidence returns HTTP 409.
+
 <a id="development"></a>
 
 ## Development and extensions

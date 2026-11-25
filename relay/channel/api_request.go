@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -380,7 +381,11 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	ctx := context.Background()
+	if info.ProductAttempt != nil {
+		ctx = c.Request.Context()
+	}
+	req, err := http.NewRequestWithContext(ctx, c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -394,6 +399,13 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	// 这样可以覆盖默认的 Authorization header 设置
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
+	}
+	if attempt := info.ProductAttempt; attempt != nil {
+		// A lost provider response leaves acceptance unknown. Keep this POST single-attempt.
+		req.GetBody = nil
+		req.Header.Del("Idempotency-Key")
+		req.Header.Del("X-Idempotency-Key")
+		req.Header.Set("X-Client-Request-Id", attempt.ID)
 	}
 	if err = signUpstreamRequest(a, c, info, req.Method, req.URL, req.Header); err != nil {
 		return nil, err
@@ -567,6 +579,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
+	if attempt := info.ProductAttempt; attempt != nil {
+		attempt.Dispatched = true
+		attempt.UpstreamModel = info.UpstreamModelName
+	}
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		// A url.Error quotes the request URL, whose query may carry a

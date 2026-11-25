@@ -12,6 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func SetProductRelayRouter(router *gin.Engine, productRelay *controller.ProductRelay) {
+	router.POST(controller.ProductChatPath, middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), productRelay.Chat)
+}
+
 func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
