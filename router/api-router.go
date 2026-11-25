@@ -357,6 +357,9 @@ func SetApiRouter(router *gin.Engine) {
 			systemInfoRoute.DELETE("/stale-instances", controller.DeleteStaleSystemInstances)
 			systemInfoRoute.DELETE("/instances/:node_name", controller.DeleteStaleSystemInstance)
 		}
+		productModelCalls := apiRouter.Group("/product-model/calls", middleware.RootAuth(), middleware.DisableCache())
+		productModelCalls.GET("/:call_id", controller.GetProductModelCall)
+		productModelCalls.POST("/:call_id/confirm", controller.ConfirmProductModelUsage)
 
 		dataRoute := apiRouter.Group("/data")
 		dataRoute.GET("/", middleware.AdminAuth(), controller.GetAllQuotaDates)

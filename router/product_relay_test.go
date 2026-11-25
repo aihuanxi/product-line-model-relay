@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -69,6 +70,7 @@ func TestProductModelRoute(t *testing.T) {
 		{"wrong product", func(claims jwt.MapClaims) { claims["productId"] = "other" }},
 		{"wrong instance credential", func(claims jwt.MapClaims) { claims["runtimeInstanceId"] = "instance-2" }},
 		{"expired", func(claims jwt.MapClaims) { claims["exp"] = time.Now().Add(-time.Second).Unix() }},
+		{"future issuance outside clock allowance", func(claims jwt.MapClaims) { claims["iat"] = time.Now().Add(10 * time.Second).Unix() }},
 		{"future validity", func(claims jwt.MapClaims) { claims["nbf"] = time.Now().Add(time.Minute).Unix() }},
 		{"missing payer", func(claims jwt.MapClaims) { delete(claims, "billingAccountId") }},
 		{"missing organization workspace", func(claims jwt.MapClaims) { delete(claims, "workspaceId") }},
@@ -102,7 +104,44 @@ func TestProductModelRoute(t *testing.T) {
 	otherModel := strings.Replace(relayTestBody, relayTestModel, "other-model", 1)
 	assert.Equal(t, http.StatusForbidden, fixture.post(t, engine, "model-scope", otherModel).Code)
 
-	fixture.writeTrust(t, 2, []string{"sample-access"})
+	_, nextKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	nextSigner := fixture
+	nextSigner.signingKey = nextKey
+	retiredAt := time.Now().Add(-time.Second)
+	fixture.writeTrust(t, 2, nil, fixture.verificationKey("test-key", &retiredAt), nextSigner.verificationKey("next-key", nil))
+	rotated := fixture.router(t)
+	for _, test := range []struct {
+		name   string
+		signer productRouteFixture
+		change func(*jwt.Token)
+	}{
+		{"old key past verification deadline", fixture, func(*jwt.Token) {}},
+		{"unknown key", nextSigner, func(token *jwt.Token) { token.Header["kid"] = "unknown" }},
+		{"wrong signature for active key", fixture, func(token *jwt.Token) { token.Header["kid"] = "next-key" }},
+		{"unsupported critical header", nextSigner, func(token *jwt.Token) {
+			token.Header["kid"] = "next-key"
+			token.Header["crit"] = []string{"extension"}
+			token.Header["extension"] = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := test.signer.request(t, "denied", relayTestBody, fixture.claims(), test.change)
+			response := httptest.NewRecorder()
+			rotated.ServeHTTP(response, req)
+			assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+		})
+	}
+	response = httptest.NewRecorder()
+	claims := fixture.claims()
+	claims["iat"] = time.Now().Add(3 * time.Second).Unix()
+	rotated.ServeHTTP(response, nextSigner.request(t, "json", relayTestBody, claims, func(token *jwt.Token) {
+		token.Header["kid"] = "next-key"
+	}))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, jsonReply.Header().Get("X-Product-Attempt-Id"), response.Header().Get("X-Product-Attempt-Id"))
+
+	fixture.writeTrust(t, 3, []string{"sample-access"})
 	assert.Equal(t, http.StatusUnauthorized, fixture.post(t, fixture.router(t), "revoked", relayTestBody).Code)
 	require.Len(t, h.upstream.captured(), 2)
 
@@ -164,6 +203,8 @@ func TestProductModelUsageOutbox(t *testing.T) {
 	engine := fixture.router(t)
 	h.upstream.respond = func(w http.ResponseWriter, attempt int, request capturedRequest) {
 		w.Header().Set("X-Request-Id", fmt.Sprintf("provider-%d", attempt))
+		w.Header().Set("X-Product-Call-Id", "provider-call")
+		w.Header().Set("X-Product-Attempt-Id", "provider-attempt")
 		switch attempt {
 		case 3:
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -184,6 +225,7 @@ func TestProductModelUsageOutbox(t *testing.T) {
 	attemptID := jsonResponse.Header().Get("X-Product-Attempt-Id")
 	require.NotEmpty(t, callID)
 	require.NotEmpty(t, attemptID)
+	assert.NotEqual(t, "provider-call", callID)
 	require.Len(t, h.upstream.captured(), 1)
 	assert.Equal(t, attemptID, h.upstream.captured()[0].Header.Get("X-Client-Request-Id"))
 
@@ -236,18 +278,19 @@ func TestProductModelUsageOutbox(t *testing.T) {
 	seenMu.Unlock()
 
 	now := time.Now().Unix()
+	scope := model.ProductCallScope{ProductID: "sample-product", Environment: "test", PartitionID: "relay-test"}
 	_, won, err := model.BeginProductModelCall(t.Context(), model.ProductModelCall{
-		CallID: "abandoned", AttemptID: "abandoned-attempt", ProductID: "sample-product", Environment: "test",
+		CallID: "abandoned", AttemptID: "abandoned-attempt", ProductID: scope.ProductID, Environment: scope.Environment, DeliveryScope: scope.Key(),
 		ProductUserID: "sample-user", BillingAccountID: "sample-payer", ReviewAfter: now - 1, State: model.ProductCallInFlight,
 	}, "recovery-fixture-allocation", 1)
 	require.NoError(t, err)
 	require.True(t, won)
 
-	reporter, err := service.NewProductUsageReporter(endpoint, "fixture-metering-key")
+	reporter, err := service.NewProductUsageReporter(endpoint, "fixture-metering-key", scope)
 	require.NoError(t, err)
 	require.ErrorContains(t, reporter.Flush(t.Context()), "503")
 	require.NoError(t, model.DB.Model(&model.ProductModelCall{}).Where("deliver_after > ?", now).Update("deliver_after", now).Error)
-	restartedReporter, err := service.NewProductUsageReporter(endpoint, "fixture-metering-key")
+	restartedReporter, err := service.NewProductUsageReporter(endpoint, "fixture-metering-key", scope)
 	require.NoError(t, err)
 	require.NoError(t, restartedReporter.Flush(t.Context()))
 	require.NoError(t, restartedReporter.Flush(t.Context()))
@@ -320,6 +363,197 @@ func TestProductModelReplayDuringProviderCall(t *testing.T) {
 	require.Len(t, h.upstream.captured(), 1)
 }
 
+func TestProductModelUsageReview(t *testing.T) {
+	h := newRelayHarness(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ProductModelCall{}, &model.ProductModelAllocation{}, &model.UserSession{}, &model.AuditLog{}))
+	channel := h.install(t, h.newChannel(constant.ChannelTypeOpenAI, "fake-upstream-key"))
+	h.upstream.respond = func(w http.ResponseWriter, _ int, _ capturedRequest) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "provider-cut")
+		frame, _, _ := strings.Cut(chatStream, "\n\n")
+		_, _ = io.WriteString(w, frame+"\n\n")
+	}
+	var seenMu sync.Mutex
+	var events []map[string]any
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch struct{ Events []map[string]any }
+		if !assert.NoError(t, common.DecodeJsonBody(r.Body, &batch)) || !assert.Len(t, batch.Events, 1) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		event := batch.Events[0]
+		seenMu.Lock()
+		defer seenMu.Unlock()
+		events = append(events, event)
+		if len(events) == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		status := "pending"
+		if len(events) > 1 {
+			status = "posted"
+		}
+		w.Header().Set("X-Huanxi-Contract-Version", service.ProductResourceContract)
+		ack, _ := common.Marshal(gin.H{"results": []gin.H{{"eventId": event["eventId"], "status": status}}})
+		_, _ = w.Write(ack)
+	}))
+	t.Cleanup(receiver.Close)
+	fixture := newProductRouteFixture(t, channel.Id, receiver.URL, 1)
+	engine := fixture.router(t)
+	SetApiRouter(engine)
+	streamBody := strings.TrimSuffix(relayTestBody, "}") + `,"stream":true}`
+	cut := fixture.post(t, engine, "cut", streamBody)
+	callID, attemptID := cut.Header().Get("X-Product-Call-Id"), cut.Header().Get("X-Product-Attempt-Id")
+	require.NotEmpty(t, callID)
+	require.NotEmpty(t, attemptID)
+	var pending model.ProductModelCall
+	require.NoError(t, model.DB.Take(&pending, "call_id = ?", callID).Error)
+	require.Equal(t, model.ProductCallPendingReview, pending.State)
+
+	now := time.Now().Unix()
+	scope := model.ProductCallScope{ProductID: "sample-product", Environment: "test", PartitionID: "relay-test"}
+	otherEnvironment := model.ProductCallScope{ProductID: scope.ProductID, Environment: "Test", PartitionID: scope.PartitionID}
+	otherPartition := model.ProductCallScope{ProductID: scope.ProductID, Environment: scope.Environment, PartitionID: "another-relay"}
+	require.NoError(t, model.DB.Create(&[]model.ProductModelCall{
+		{CallID: "other-env", AttemptID: "other-env-attempt", ProductID: otherEnvironment.ProductID, Environment: otherEnvironment.Environment,
+			DeliveryScope: otherEnvironment.Key(), State: model.ProductCallPendingReview, DeliverAfter: now},
+		{CallID: "other-partition", AttemptID: "other-partition-attempt", ProductID: otherPartition.ProductID, Environment: otherPartition.Environment,
+			DeliveryScope: otherPartition.Key(), State: model.ProductCallInFlight, ReviewAfter: now - 1},
+	}).Error)
+	reporter, err := service.NewProductUsageReporter(receiver.URL, "fixture-metering-key", scope)
+	require.NoError(t, err)
+	require.NoError(t, reporter.Flush(t.Context()))
+	var foreign model.ProductModelCall
+	require.NoError(t, model.DB.Take(&foreign, "call_id = ?", "other-partition").Error)
+	assert.Equal(t, model.ProductCallInFlight, foreign.State)
+
+	root := model.User{Username: "product-review-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AffCode: "root-review"}
+	require.NoError(t, model.DB.Create(&root).Error)
+	rootSession, err := service.CreateLoginSession(root.Id, "password", "127.0.0.1", "product-review-fixture")
+	require.NoError(t, err)
+	userSession, err := service.CreateLoginSession(h.userID, "password", "127.0.0.1", "product-review-fixture")
+	require.NoError(t, err)
+	reviewPath := "/api/product-model/calls/" + callID
+	request := func(method, path, token, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, req)
+		return response
+	}
+	confirmation := fmt.Sprintf(`{"attempt_id":%q,"evidence_ref":"provider-usage-record","input_tokens":10,"output_tokens":0}`, attemptID)
+	assert.Equal(t, http.StatusUnauthorized, request(http.MethodGet, reviewPath, "", "").Code)
+	assert.Equal(t, http.StatusForbidden, request(http.MethodPost, reviewPath+"/confirm", userSession.AccessToken, confirmation).Code)
+	read := request(http.MethodGet, reviewPath, rootSession.AccessToken, "")
+	require.Equal(t, http.StatusOK, read.Code, read.Body.String())
+	assert.Contains(t, read.Body.String(), `"provider_request_id":"provider-cut"`)
+	assert.Contains(t, read.Body.String(), `"status":"pending_review"`)
+	assert.Equal(t, http.StatusNotFound, request(http.MethodPost, reviewPath+"/confirm", rootSession.AccessToken, strings.Replace(confirmation, attemptID, "other-attempt", 1)).Code)
+	assert.Equal(t, http.StatusBadRequest, request(http.MethodPost, reviewPath+"/confirm", rootSession.AccessToken, strings.Replace(confirmation, `,"output_tokens":0`, "", 1)).Code)
+	confirm := request(http.MethodPost, reviewPath+"/confirm", rootSession.AccessToken, confirmation)
+	require.Equal(t, http.StatusOK, confirm.Code, confirm.Body.String())
+	assert.Equal(t, http.StatusOK, request(http.MethodPost, reviewPath+"/confirm", rootSession.AccessToken, confirmation).Code)
+	assert.Equal(t, http.StatusConflict, request(http.MethodPost, reviewPath+"/confirm", rootSession.AccessToken, strings.Replace(confirmation, `"input_tokens":10`, `"input_tokens":11`, 1)).Code)
+	assert.Contains(t, fixture.post(t, engine, "cut", streamBody).Body.String(), `"total_tokens":10`)
+	require.Len(t, h.upstream.captured(), 1)
+
+	require.ErrorContains(t, reporter.Flush(t.Context()), "503")
+	// A still-running pending delivery must not acknowledge the newer confirmation.
+	require.NoError(t, pending.AckDelivery(t.Context(), now))
+	var confirmed model.ProductModelCall
+	require.NoError(t, model.DB.Take(&confirmed, "call_id = ?", callID).Error)
+	require.Zero(t, confirmed.DeliveredAt)
+	require.Positive(t, confirmed.DeliverAfter)
+	require.NoError(t, model.DB.Model(&confirmed).Update("deliver_after", now).Error)
+	restarted, err := service.NewProductUsageReporter(receiver.URL, "fixture-metering-key", scope)
+	require.NoError(t, err)
+	require.NoError(t, restarted.Flush(t.Context()))
+	require.NoError(t, restarted.Flush(t.Context()))
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	require.Len(t, events, 3)
+	assert.Equal(t, events[1], events[2])
+	assert.NotEqual(t, events[0]["eventId"], events[1]["eventId"])
+	for _, field := range []string{"objectId", "attemptId", "productId", "environment", "productUserId", "workspaceId", "billingAccountId", "allocationId", "issuanceId", "admittedAt"} {
+		assert.Equal(t, events[0][field], events[1][field], field)
+	}
+	assert.Equal(t, map[string]any{"status": "pending", "reason": "provider_usage_unavailable", "evidenceRef": "provider-cut"}, events[0]["measurement"])
+	assert.Equal(t, map[string]any{"status": "confirmed", "inputTokens": float64(10), "outputTokens": float64(0), "evidenceRef": "provider-usage-record"}, events[1]["measurement"])
+}
+
+func TestProductModelRevocationPublishesDuringProvisioning(t *testing.T) {
+	newRelayHarness(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ProductModelCall{}, &model.ProductModelAllocation{}))
+	var snapshot map[string]any
+	allocationStarted := make(chan struct{})
+	finishAllocation := make(chan struct{})
+	release := sync.OnceFunc(func() { close(finishAllocation) })
+	allocationAttempt := sync.OnceFunc(func() { close(allocationStarted) })
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Huanxi-Contract-Version", service.ProductResourceContract)
+		switch r.URL.Path {
+		case "/internal/v1/resource-verification/snapshot":
+			payload, _ := common.Marshal(snapshot["snapshot"])
+			_, _ = w.Write(payload)
+		case "/internal/v1/allocations":
+			allocationAttempt()
+			select {
+			case <-finishAllocation:
+				_, _ = io.WriteString(w, `{"allocationId":"malformed-allocation-for-payer","admissionLimit":1}`)
+			case <-r.Context().Done():
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(peer.Close)
+	t.Cleanup(release)
+	fixture := newProductRouteFixture(t, 1, peer.URL, 1)
+	fixture.writeTrust(t, 2, []string{"sample-access"})
+	data, err := os.ReadFile(fixture.trustPath)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(data, &snapshot))
+	fixture.writeTrust(t, 1, nil)
+	data, err = os.ReadFile(fixture.configPath)
+	require.NoError(t, err)
+	var config map[string]any
+	require.NoError(t, common.Unmarshal(data, &config))
+	config["billing_account_ids"] = []string{"sample-payer", "another-payer"}
+	data, err = common.Marshal(config)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(fixture.configPath, data, 0600))
+
+	product, err := controller.LoadProductRelay(fixture.configPath, "fixture-metering-key")
+	require.NoError(t, err)
+	engine := gin.New()
+	SetRelayRouter(engine)
+	SetProductRelayRouter(engine, product)
+	before := fixture.post(t, engine, "before", "{")
+	require.Equal(t, http.StatusBadRequest, before.Code, before.Body.String())
+	ctx, stop := context.WithCancel(t.Context())
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		product.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		release()
+		stop()
+		<-finished
+	})
+	select {
+	case <-allocationStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background allocation did not start")
+	}
+	assert.Equal(t, http.StatusUnauthorized, fixture.post(t, engine, "while-allocating", "{").Code)
+	assert.Equal(t, http.StatusUnauthorized, fixture.post(t, fixture.router(t), "after-restart", "{").Code)
+}
+
 const testInstanceCredential = "fixture-only-instance-credential-00000001"
 
 type productRouteFixture struct {
@@ -349,19 +583,26 @@ func newProductRouteFixture(t *testing.T, channelID int, billingURL string, maxC
 	return f
 }
 
-func (f productRouteFixture) writeTrust(t *testing.T, version int, revoked []string) {
+func (f productRouteFixture) verificationKey(kid string, until *time.Time) map[string]any {
+	return map[string]any{
+		"kid": kid, "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "verifyUntil": until,
+		"x": base64.RawURLEncoding.EncodeToString(f.signingKey.Public().(ed25519.PublicKey)),
+	}
+}
+
+func (f productRouteFixture) writeTrust(t *testing.T, version int, revoked []string, keys ...map[string]any) {
 	t.Helper()
 	revocations := make([]map[string]any, 0, len(revoked))
 	for _, id := range revoked {
 		revocations = append(revocations, map[string]any{"accessId": id, "revokedAt": time.Now().UTC()})
 	}
+	if len(keys) == 0 {
+		keys = []map[string]any{f.verificationKey("test-key", nil)}
+	}
 	data, err := common.Marshal(map[string]any{
 		"snapshot": map[string]any{
 			"version": version, "contractVersion": service.ProductResourceContract, "productId": "sample-product", "environment": "test", "audience": "model-relay",
-			"keys": []map[string]any{{
-				"kid": "test-key", "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
-				"x": base64.RawURLEncoding.EncodeToString(f.signingKey.Public().(ed25519.PublicKey)),
-			}},
+			"keys": keys,
 			"instances": []map[string]any{
 				{"runtimeInstanceId": "instance-1", "generation": 1, "credentialSha256": fmt.Sprintf("%x", sha256.Sum256([]byte(testInstanceCredential)))},
 				{"runtimeInstanceId": "instance-2", "generation": 1, "credentialSha256": fmt.Sprintf("%x", sha256.Sum256([]byte("fixture-only-different-instance-credential")))},
@@ -388,11 +629,14 @@ func (f productRouteFixture) claims() jwt.MapClaims {
 	}
 }
 
-func (f productRouteFixture) request(t *testing.T, key, body string, claims jwt.MapClaims) *http.Request {
+func (f productRouteFixture) request(t *testing.T, key, body string, claims jwt.MapClaims, changes ...func(*jwt.Token)) *http.Request {
 	t.Helper()
 	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
 	token.Header["kid"] = "test-key"
 	token.Header["typ"] = "resource+jwt"
+	for _, change := range changes {
+		change(token)
+	}
 	signed, err := token.SignedString(f.signingKey)
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPost, controller.ProductChatPath+"?key=fixture-query", strings.NewReader(body))

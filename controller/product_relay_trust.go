@@ -13,10 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/golang-jwt/jwt/v5"
@@ -126,7 +128,9 @@ func LoadProductRelay(path, serviceToken string) (*ProductRelay, error) {
 		slices.ContainsFunc(cfg.BillingAccountIDs, func(id string) bool { return !validProductID(id) }) {
 		return nil, errors.New("incomplete or invalid product relay configuration")
 	}
-	r.reporter, err = service.NewProductUsageReporter(cfg.BillingURL, serviceToken)
+	r.reporter, err = service.NewProductUsageReporter(cfg.BillingURL, serviceToken, model.ProductCallScope{
+		ProductID: cfg.ProductID, Environment: cfg.Environment, PartitionID: cfg.PartitionID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -183,21 +187,27 @@ func (r *ProductRelay) compileTrust(material productVerificationMaterial) (*prod
 		trust.revoked[revocation.AccessID] = true
 	}
 	for account, allocation := range material.Allocations {
-		if !slices.Contains(r.config.BillingAccountIDs, account) || allocation.BillingAccountID != account ||
-			allocation.Audience != service.ProductResourceAudience || allocation.PartitionID != r.config.PartitionID ||
-			!validProductID(allocation.ID) || allocation.AdmissionLimit < 0 {
+		if !slices.Contains(r.config.BillingAccountIDs, account) || !r.validAllocation(account, allocation) {
 			return nil, errors.New("invalid product allocation")
 		}
 	}
 	return trust, nil
 }
 
+func (r *ProductRelay) validAllocation(account string, allocation productAllocation) bool {
+	return allocation.BillingAccountID == account && allocation.Audience == service.ProductResourceAudience &&
+		allocation.PartitionID == r.config.PartitionID && validProductID(allocation.ID) && allocation.AdmissionLimit >= 0
+}
+
 func (r *ProductRelay) Run(ctx context.Context) {
-	go r.reporter.Run(ctx)
+	var reporter sync.WaitGroup
+	reporter.Go(func() { r.reporter.Run(ctx) })
+	defer reporter.Wait()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	nextAccount := 0
 	for ctx.Err() == nil {
-		if err := r.syncTrust(ctx); err != nil && ctx.Err() == nil {
+		if err := r.syncTrust(ctx, &nextAccount); err != nil && ctx.Err() == nil {
 			common.SysError("sync product verification: " + err.Error())
 		}
 		select {
@@ -208,35 +218,64 @@ func (r *ProductRelay) Run(ctx context.Context) {
 	}
 }
 
-func (r *ProductRelay) syncTrust(ctx context.Context) error {
-	material := productVerificationMaterial{Allocations: make(map[string]productAllocation)}
-	if err := r.reporter.ResourceJSON(ctx, http.MethodGet, "/internal/v1/resource-verification/snapshot", nil, &material.Snapshot); err != nil {
+func (r *ProductRelay) syncTrust(ctx context.Context, nextAccount *int) error {
+	var snapshot productVerificationSnapshot
+	if err := r.reporter.ResourceJSON(ctx, http.MethodGet, "/internal/v1/resource-verification/snapshot", nil, &snapshot); err != nil {
 		return err
 	}
 	current := r.trust.Load()
+	material := productVerificationMaterial{Snapshot: snapshot}
 	if current != nil {
-		if material.Snapshot.Version < current.material.Snapshot.Version {
+		if snapshot.Version < current.material.Snapshot.Version {
 			return errors.New("product verification snapshot version went backwards")
 		}
-		maps.Copy(material.Allocations, current.material.Allocations)
+		material.Allocations = current.material.Allocations
 	}
+	if current == nil || snapshot.Version > current.material.Snapshot.Version {
+		if err := r.storeTrust(material); err != nil {
+			return err
+		}
+	} else {
+		material = current.material
+	}
+
+	// Publish revocations before provisioning. Bound the entire allocation pass
+	// so a slow account cannot hold up the next verification snapshot.
+	provisioning, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	previous := material.Allocations
+	material.Allocations = make(map[string]productAllocation, len(previous))
+	maps.Copy(material.Allocations, previous)
 	var allocationErr error
-	for _, account := range r.config.BillingAccountIDs {
+	accounts := r.config.BillingAccountIDs
+	for range len(accounts) {
+		if provisioning.Err() != nil {
+			break
+		}
+		account := accounts[*nextAccount]
+		*nextAccount = (*nextAccount + 1) % len(accounts)
 		if _, exists := material.Allocations[account]; exists {
 			continue
 		}
 		var allocation productAllocation
 		request := map[string]string{"billingAccountId": account, "partitionId": r.config.PartitionID}
-		if err := r.reporter.ResourceJSON(ctx, http.MethodPost, "/internal/v1/allocations", request, &allocation); err != nil {
+		if err := r.reporter.ResourceJSON(provisioning, http.MethodPost, "/internal/v1/allocations", request, &allocation); err != nil {
 			allocationErr = errors.Join(allocationErr, err)
+			continue
+		}
+		if !r.validAllocation(account, allocation) {
+			allocationErr = errors.Join(allocationErr, errors.New("invalid product allocation"))
 			continue
 		}
 		material.Allocations[account] = allocation
 	}
-	if current != nil && material.Snapshot.Version == current.material.Snapshot.Version &&
-		maps.Equal(material.Allocations, current.material.Allocations) {
-		return allocationErr
+	if len(material.Allocations) > len(previous) {
+		allocationErr = errors.Join(allocationErr, r.storeTrust(material))
 	}
+	return allocationErr
+}
+
+func (r *ProductRelay) storeTrust(material productVerificationMaterial) error {
 	trust, err := r.compileTrust(material)
 	if err != nil {
 		return err
@@ -260,7 +299,7 @@ func (r *ProductRelay) syncTrust(ctx context.Context) error {
 		return err
 	}
 	r.trust.Store(trust)
-	return allocationErr
+	return nil
 }
 
 func (r *ProductRelay) authorize(raw, credential string, trust *productRelayTrust, now time.Time) (*productGrant, error) {
@@ -268,18 +307,20 @@ func (r *ProductRelay) authorize(raw, credential string, trust *productRelayTrus
 	_, err := jwt.ParseWithClaims(raw, grant, func(token *jwt.Token) (any, error) {
 		kid, _ := token.Header["kid"].(string)
 		key, exists := trust.keys[kid]
-		if token.Header["typ"] != "resource+jwt" || !exists ||
+		_, hasCriticalHeader := token.Header["crit"]
+		if token.Header["typ"] != "resource+jwt" || !exists || hasCriticalHeader ||
 			(key.verifyUntil != nil && !now.Before(*key.verifyUntil)) {
 			return nil, errors.New("untrusted resource token key or type")
 		}
 		return key.publicKey, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
 		jwt.WithIssuer(r.config.Issuer), jwt.WithAudience(service.ProductResourceAudience),
-		jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithTimeFunc(func() time.Time { return now }))
+		jwt.WithExpirationRequired(), jwt.WithTimeFunc(func() time.Time { return now }))
 	if err != nil {
 		return nil, errors.New("invalid resource credential")
 	}
-	if grant.IssuedAt == nil || !grant.ExpiresAt.After(grant.IssuedAt.Time) ||
+	// The v1 allowance applies to issuance time. Expiry still uses the local clock.
+	if grant.IssuedAt == nil || grant.IssuedAt.After(now.Add(5*time.Second)) || !grant.ExpiresAt.After(grant.IssuedAt.Time) ||
 		grant.ExpiresAt.Sub(grant.IssuedAt.Time) > time.Hour || len(grant.Audience) != 1 ||
 		grant.ProductID != r.config.ProductID || grant.Environment != r.config.Environment ||
 		!validProductID(grant.Subject) || !validProductID(grant.AccessID) || !validProductID(grant.ID) ||

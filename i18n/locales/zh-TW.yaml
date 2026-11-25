@@ -61,6 +61,10 @@ product_relay.channel_unavailable: "設定的產品渠道無法使用。"
 product_relay.persist_usage: "無法儲存模型實際用量。"
 product_relay.incomplete_stream: "上游回應串流在完成前中斷。"
 product_relay.verification_unavailable: "產品驗簽暫時無法使用。"
+product_relay.call_not_found: "找不到該產品模型呼叫嘗試。"
+product_relay.invalid_confirmation: "請提供原嘗試 ID、證據編號及實際輸入與輸出 Token 數。"
+product_relay.confirmation_conflict: "無法使用提交的證據確認該產品模型呼叫嘗試。"
+product_relay.metering_unavailable: "產品計量暫時無法使用。"
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}的初始令牌"

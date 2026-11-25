@@ -165,9 +165,10 @@ func (r *ProductRelay) Chat(c *gin.Context) {
 	allocation := trust.material.Allocations[grant.BillingAccountID]
 	callID := sha256.Sum256([]byte(grant.Environment + "\x00" + grant.ProductID + "\x00" + grant.Subject + "\x00" + keys[0]))
 	allocationKey := sha256.Sum256([]byte(grant.Environment + "\x00" + grant.ProductID + "\x00" + allocation.ID))
+	scope := model.ProductCallScope{ProductID: grant.ProductID, Environment: grant.Environment, PartitionID: r.config.PartitionID}
 	call, chosen, err := model.BeginProductModelCall(c.Request.Context(), model.ProductModelCall{
 		CallID: hex.EncodeToString(callID[:]), AttemptID: uuid.NewString(), RequestHash: bodyHash, State: model.ProductCallInFlight,
-		ProductID: grant.ProductID, Environment: grant.Environment, ProductUserID: grant.Subject,
+		ProductID: grant.ProductID, Environment: grant.Environment, DeliveryScope: scope.Key(), ProductUserID: grant.Subject,
 		WorkspaceID: grant.WorkspaceID, BillingAccountID: grant.BillingAccountID, OrganizationID: grant.OrganizationID, InstanceID: grant.InstanceID,
 		AccessID: grant.AccessID, IssuanceID: grant.ID, AllocationID: allocation.ID, Model: request.Model, ChannelID: r.config.ChannelID,
 		CreatedAt:   admittedAt.UnixMilli(),
@@ -187,8 +188,8 @@ func (r *ProductRelay) Chat(c *gin.Context) {
 		productError(c, http.StatusConflict, "idempotency_conflict", i18n.MsgProductIdempotencyConflict)
 		return
 	}
-	c.Header("X-Product-Call-Id", call.CallID)
-	c.Header("X-Product-Attempt-Id", call.AttemptID)
+	c.Header(relaycommon.ProductCallIDHeader, call.CallID)
+	c.Header(relaycommon.ProductAttemptIDHeader, call.AttemptID)
 	if !chosen {
 		result := gin.H{"call_id": call.CallID, "attempt_id": call.AttemptID, "status": call.State}
 		if call.State == model.ProductCallConfirmed {

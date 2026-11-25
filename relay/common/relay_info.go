@@ -81,6 +81,11 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+const (
+	ProductCallIDHeader    = "X-Product-Call-Id"
+	ProductAttemptIDHeader = "X-Product-Attempt-Id"
+)
+
 // ProductRelayAttempt carries provider evidence to the local metering record.
 // The authorization and customer attribution stay at the product entry point.
 type ProductRelayAttempt struct {

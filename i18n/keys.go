@@ -69,6 +69,10 @@ const (
 	MsgProductPersistUsage               = "product_relay.persist_usage"
 	MsgProductIncompleteStream           = "product_relay.incomplete_stream"
 	MsgProductVerificationUnavailable    = "product_relay.verification_unavailable"
+	MsgProductCallNotFound               = "product_relay.call_not_found"
+	MsgProductInvalidConfirmation        = "product_relay.invalid_confirmation"
+	MsgProductConfirmationConflict       = "product_relay.confirmation_conflict"
+	MsgProductMeteringUnavailable        = "product_relay.metering_unavailable"
 )
 
 // Emails and the name of the token created at registration, in the

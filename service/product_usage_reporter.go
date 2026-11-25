@@ -26,9 +26,10 @@ type ProductUsageReporter struct {
 	endpoint string
 	token    string
 	client   *http.Client
+	scope    model.ProductCallScope
 }
 
-func NewProductUsageReporter(baseURL, token string) (*ProductUsageReporter, error) {
+func NewProductUsageReporter(baseURL, token string, scope model.ProductCallScope) (*ProductUsageReporter, error) {
 	target, err := url.Parse(baseURL)
 	if err != nil || target.Hostname() == "" || target.User != nil || target.RawQuery != "" || target.Fragment != "" || token == "" {
 		return nil, errors.New("product metering requires a URL and service token")
@@ -37,8 +38,11 @@ func NewProductUsageReporter(baseURL, token string) (*ProductUsageReporter, erro
 	if target.Scheme != "https" && !(target.Scheme == "http" && address.IsLoopback()) {
 		return nil, errors.New("product metering requires HTTPS or a loopback test URL")
 	}
+	if scope.ProductID == "" || scope.Environment == "" || scope.PartitionID == "" {
+		return nil, errors.New("product metering requires a product, environment and partition")
+	}
 	return &ProductUsageReporter{
-		endpoint: strings.TrimRight(target.String(), "/"), token: token,
+		endpoint: strings.TrimRight(target.String(), "/"), token: token, scope: scope,
 		client: &http.Client{
 			Timeout:       5 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -92,10 +96,10 @@ func (r *ProductUsageReporter) Run(ctx context.Context) {
 // the same event available for retry after its persisted backoff.
 func (r *ProductUsageReporter) Flush(ctx context.Context) error {
 	now := time.Now().Unix()
-	if err := model.ReviewExpiredProductModelCalls(ctx, now); err != nil {
+	if err := r.scope.ReviewExpired(ctx, now); err != nil {
 		return err
 	}
-	due, err := model.DueProductModelCalls(ctx, now, 50)
+	due, err := r.scope.Due(ctx, now, 50)
 	if err != nil {
 		return err
 	}
@@ -124,6 +128,10 @@ func (r *ProductUsageReporter) Flush(ctx context.Context) error {
 		if call.State == model.ProductCallConfirmed {
 			event.Measurement.Status = "confirmed"
 			event.Measurement.InputTokens, event.Measurement.OutputTokens = call.InputTokens, call.OutputTokens
+			if call.ReviewEvidence != "" {
+				event.EventID += "-confirmed"
+				event.Measurement.EvidenceRef = call.ReviewEvidence
+			}
 		} else {
 			event.Measurement.Status = "pending"
 			event.Measurement.Reason = "provider_usage_unavailable"
@@ -146,14 +154,15 @@ func (r *ProductUsageReporter) Flush(ctx context.Context) error {
 	if err := r.ResourceJSON(ctx, http.MethodPost, "/internal/v1/usage:ingest", batch, &ack); err != nil {
 		return err
 	}
-	accepted := make(map[string]bool, len(ack.Results))
+	accepted := make(map[string]string, len(ack.Results))
 	for _, result := range ack.Results {
-		accepted[result.EventID] = result.Status == "posted" || result.Status == "pending"
+		accepted[result.EventID] = result.Status
 	}
 	var ackErrors error
 	missing := 0
 	for index, call := range claimed {
-		if accepted[events[index].EventID] {
+		status := accepted[events[index].EventID]
+		if status == "posted" || (status == "pending" && call.State == model.ProductCallPendingReview) {
 			ackErrors = errors.Join(ackErrors, call.AckDelivery(ctx, time.Now().Unix()))
 		} else {
 			missing++

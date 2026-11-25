@@ -170,6 +170,8 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if attempt := info.ProductAttempt; attempt != nil {
+			httpResp.Header.Del(relaycommon.ProductCallIDHeader)
+			httpResp.Header.Del(relaycommon.ProductAttemptIDHeader)
 			attempt.UpstreamStatus = httpResp.StatusCode
 			attempt.ProviderRequest = httpResp.Header.Get("X-Request-Id")
 			if attempt.ProviderRequest != "" {

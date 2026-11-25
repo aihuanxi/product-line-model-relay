@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -16,7 +18,22 @@ const (
 	ProductCallPendingReview = "pending_review"
 )
 
-var ErrProductAllocationExhausted = errors.New("product model allocation exhausted")
+var (
+	ErrProductAllocationExhausted  = errors.New("product model allocation exhausted")
+	ErrProductConfirmationConflict = errors.New("product model usage confirmation conflicts with the recorded attempt")
+)
+
+type ProductCallScope struct {
+	ProductID   string
+	Environment string
+	PartitionID string
+}
+
+// Key preserves the exact scope even when the database compares text case-insensitively.
+func (scope ProductCallScope) Key() string {
+	digest := sha256.Sum256([]byte(scope.ProductID + "\x00" + scope.Environment + "\x00" + scope.PartitionID))
+	return hex.EncodeToString(digest[:])
+}
 
 type ProductModelCall struct {
 	CallID           string `gorm:"size:64;primaryKey"`
@@ -24,6 +41,7 @@ type ProductModelCall struct {
 	RequestHash      string `gorm:"size:64;not null"`
 	ProductID        string `gorm:"size:128;not null"`
 	Environment      string `gorm:"size:128;not null"`
+	DeliveryScope    string `gorm:"size:64;not null;default:'';index"`
 	ProductUserID    string `gorm:"size:128;not null"`
 	WorkspaceID      string `gorm:"size:128;not null"`
 	BillingAccountID string `gorm:"size:128;not null"`
@@ -37,6 +55,7 @@ type ProductModelCall struct {
 	UpstreamModel    string `gorm:"size:255"`
 	ProviderRequest  string `gorm:"size:128"`
 	ProviderReply    string `gorm:"size:128"`
+	ReviewEvidence   string `gorm:"size:128;not null;default:''"`
 	State            string `gorm:"size:24;not null;index:idx_product_call_review"`
 	InputTokens      *int64
 	OutputTokens     *int64
@@ -113,30 +132,58 @@ func (call ProductModelCall) Finish(ctx context.Context, state string) error {
 	return update.Error
 }
 
+func (call ProductModelCall) ConfirmReviewedUsage(ctx context.Context, evidence string, input, output int64) error {
+	db := DB.WithContext(ctx)
+	now := time.Now().Unix()
+	update := db.Model(&ProductModelCall{}).
+		Where("call_id = ? AND attempt_id = ? AND state = ?", call.CallID, call.AttemptID, ProductCallPendingReview).
+		Updates(map[string]any{
+			"state": ProductCallConfirmed, "finished_at": now, "review_evidence": evidence,
+			"input_tokens": input, "output_tokens": output, "total_tokens": input + output,
+			"deliver_after": now, "delivery_tries": 0, "delivered_at": 0,
+		})
+	if update.Error != nil || update.RowsAffected == 1 {
+		return update.Error
+	}
+	var stored ProductModelCall
+	if err := db.Take(&stored, "call_id = ? AND attempt_id = ?", call.CallID, call.AttemptID).Error; err != nil {
+		return err
+	}
+	if stored.State == ProductCallConfirmed && stored.ReviewEvidence == evidence && stored.InputTokens != nil &&
+		*stored.InputTokens == input && stored.OutputTokens != nil && *stored.OutputTokens == output {
+		return nil
+	}
+	return ErrProductConfirmationConflict
+}
+
 // ReviewExpiredProductModelCalls recovers attempts whose process died before
 // recording a result. The original attempt remains the authority for review.
-func ReviewExpiredProductModelCalls(ctx context.Context, now int64) error {
-	return DB.WithContext(ctx).Model(&ProductModelCall{}).
+func (scope ProductCallScope) ReviewExpired(ctx context.Context, now int64) error {
+	return scope.calls(ctx).
 		Where("state = ? AND review_after <= ?", ProductCallInFlight, now).
 		Updates(map[string]any{"state": ProductCallPendingReview, "finished_at": now, "deliver_after": now}).Error
 }
 
-func DueProductModelCalls(ctx context.Context, now int64, limit int) ([]ProductModelCall, error) {
+func (scope ProductCallScope) Due(ctx context.Context, now int64, limit int) ([]ProductModelCall, error) {
 	var calls []ProductModelCall
-	err := DB.WithContext(ctx).Where("deliver_after > 0 AND deliver_after <= ?", now).
+	err := scope.calls(ctx).Where("deliver_after > 0 AND deliver_after <= ?", now).
 		Order("deliver_after, call_id").Limit(limit).Find(&calls).Error
 	return calls, err
 }
 
+func (scope ProductCallScope) calls(ctx context.Context) *gorm.DB {
+	return DB.WithContext(ctx).Model(&ProductModelCall{}).Where("delivery_scope = ?", scope.Key())
+}
+
 func (call ProductModelCall) ClaimDelivery(ctx context.Context, next int64) (bool, error) {
 	result := DB.WithContext(ctx).Model(&ProductModelCall{}).
-		Where("call_id = ? AND deliver_after = ? AND delivery_tries = ?", call.CallID, call.DeliverAfter, call.DeliveryTries).
+		Where("call_id = ? AND state = ? AND deliver_after = ? AND delivery_tries = ?", call.CallID, call.State, call.DeliverAfter, call.DeliveryTries).
 		Updates(map[string]any{"deliver_after": next, "delivery_tries": gorm.Expr("delivery_tries + 1")})
 	return result.RowsAffected == 1, result.Error
 }
 
 func (call ProductModelCall) AckDelivery(ctx context.Context, now int64) error {
 	return DB.WithContext(ctx).Model(&ProductModelCall{}).
-		Where("call_id = ? AND delivery_tries = ?", call.CallID, call.DeliveryTries+1).
+		Where("call_id = ? AND state = ? AND delivery_tries = ?", call.CallID, call.State, call.DeliveryTries+1).
 		Updates(map[string]any{"deliver_after": 0, "delivered_at": now}).Error
 }
